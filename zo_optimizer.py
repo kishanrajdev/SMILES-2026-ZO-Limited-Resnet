@@ -26,6 +26,7 @@ from typing import Callable
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class ZeroOrderOptimizer:
@@ -65,10 +66,17 @@ class ZeroOrderOptimizer:
         lr: float = 1e-3,
         eps: float = 1e-3,
         perturbation_mode: str = "gaussian",
+        use_spsa: bool = True,
+        momentum: float = 0.9,
+        eps_scheduler: str = "const",
     ) -> None:
         self.model = model
         self.lr = lr
         self.eps = eps
+        self.use_spsa = use_spsa
+        self.momentum = momentum
+        self.eps_scheduler = eps_scheduler
+        self.step_count = 0
 
         if perturbation_mode not in ("gaussian", "uniform"):
             raise ValueError(
@@ -76,6 +84,9 @@ class ZeroOrderOptimizer:
                 f"got '{perturbation_mode}'"
             )
         self.perturbation_mode = perturbation_mode
+
+        # Momentum accumulator for each parameter
+        self.momentum_buffer: dict[str, torch.Tensor] = {}
 
         # ------------------------------------------------------------------
         # STUDENT: Set self.layer_names to the parameters you want to tune.
@@ -117,23 +128,26 @@ class ZeroOrderOptimizer:
             )
         return {n: named[n] for n in self.layer_names}
 
-    def _sample_direction(self, param: torch.Tensor) -> torch.Tensor:
-        """Sample a random unit-norm perturbation vector of the same shape as ``param``.
+    def _sample_direction(self, param: torch.Tensor, normalize: bool = True) -> torch.Tensor:
+        """Sample a random perturbation vector of the same shape as ``param``.
 
         Args:
             param: The parameter tensor whose shape determines the output shape.
+            normalize: If True, normalize to unit L2 norm. For SPSA, often no normalization
+                      is needed since the finite-difference estimator scales it anyway.
 
         Returns:
-            A tensor of the same shape as ``param``, normalised to unit L2 norm.
+            A tensor of the same shape as ``param``.
         """
         if self.perturbation_mode == "gaussian":
             u = torch.randn_like(param)
         else:  # uniform
             u = torch.rand_like(param) * 2.0 - 1.0
 
-        norm = u.norm()
-        if norm > 0:
-            u = u / norm
+        if normalize:
+            norm = u.norm()
+            if norm > 0:
+                u = u / norm
         return u
 
     def _estimate_grad(
@@ -141,58 +155,72 @@ class ZeroOrderOptimizer:
         loss_fn: Callable[[], float],
         params: dict[str, nn.Parameter],
     ) -> dict[str, torch.Tensor]:
-        """Estimate a pseudo-gradient for each active parameter.
+        """Estimate pseudo-gradients using SPSA or per-parameter estimation.
 
-        Skeleton: 2-point central-difference estimator.
-        For each active parameter ``p`` independently:
-            1. Sample a random unit vector ``u`` of the same shape as ``p``.
-            2. Evaluate  f_plus  = loss_fn() with ``p ← p + eps * u``
-            3. Evaluate  f_minus = loss_fn() with ``p ← p - eps * u``
-            4. Restore ``p`` to its original value.
-            5. Pseudo-gradient ← ``(f_plus - f_minus) / (2 * eps) * u``
-
-        This is an unbiased estimator of the directional derivative along ``u``
-        scaled back to parameter space.
+        SPSA (Simultaneous Perturbation Stochastic Approximation):
+            Uses only 2 forward passes regardless of model size by perturbing
+            all parameters simultaneously with the same random direction.
+            - Sample a single random direction ``u`` for all parameters.
+            - Evaluate f_plus and f_minus with all parameters perturbed by ±eps*u.
+            - Compute gradient as (f_plus - f_minus) / (2*eps) * u for each param.
 
         Args:
-            loss_fn: Callable that evaluates the objective on the current batch
-                     and returns a scalar ``float``. May be called multiple
-                     times; each call must use the *same* batch.
-            params:  Dict of active parameter name → tensor (from
-                     ``_active_params``).
+            loss_fn: Callable that evaluates the objective on the current batch.
+            params:  Dict of active parameter name → tensor.
 
         Returns:
-            Dict mapping each parameter name to its estimated pseudo-gradient
-            tensor (same shape as the parameter).
-
-        Student task:
-            Replace this with a more efficient or accurate estimator:
+            Dict mapping each parameter name to its estimated pseudo-gradient.
         """
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the gradient estimation below.
-        # ------------------------------------------------------------------
         grads: dict[str, torch.Tensor] = {}
 
-        with torch.no_grad():
-            for name, param in params.items():
-                u = self._sample_direction(param)
+        if self.use_spsa:
+            # SPSA: single shared perturbation for all parameters
+            with torch.no_grad():
+                # Sample a shared random direction for all parameters
+                perturbations = {}
+                for name, param in params.items():
+                    # Don't normalize for SPSA; let the finite-difference scale it
+                    perturbations[name] = self._sample_direction(param, normalize=False)
 
                 # f(x + eps * u)
-                param.data.add_(self.eps * u)
+                for name, param in params.items():
+                    param.data.add_(self.eps * perturbations[name])
                 f_plus = loss_fn()
 
-                # f(x - eps * u)  — restore then subtract
-                param.data.sub_(2.0 * self.eps * u)
+                # f(x - eps * u)
+                for name, param in params.items():
+                    param.data.sub_(2.0 * self.eps * perturbations[name])
                 f_minus = loss_fn()
 
-                # Restore original value
-                param.data.add_(self.eps * u)
+                # Restore original values
+                for name, param in params.items():
+                    param.data.add_(self.eps * perturbations[name])
 
-                grad_estimate = ((f_plus - f_minus) / (2.0 * self.eps)) * u
-                grads[name] = grad_estimate
+                # Compute gradient estimate for each parameter
+                grad_scale = (f_plus - f_minus) / (2.0 * self.eps)
+                for name, param in params.items():
+                    grads[name] = grad_scale * perturbations[name]
+        else:
+            # Fallback: per-parameter central-difference estimator
+            with torch.no_grad():
+                for name, param in params.items():
+                    u = self._sample_direction(param, normalize=True)
+
+                    # f(x + eps * u)
+                    param.data.add_(self.eps * u)
+                    f_plus = loss_fn()
+
+                    # f(x - eps * u)
+                    param.data.sub_(2.0 * self.eps * u)
+                    f_minus = loss_fn()
+
+                    # Restore original value
+                    param.data.add_(self.eps * u)
+
+                    grad_estimate = ((f_plus - f_minus) / (2.0 * self.eps)) * u
+                    grads[name] = grad_estimate
 
         return grads
-        # ------------------------------------------------------------------
 
     def _update_params(
         self,
@@ -201,27 +229,33 @@ class ZeroOrderOptimizer:
     ) -> None:
         """Apply the estimated pseudo-gradients to the active parameters.
 
-        Skeleton: vanilla gradient *descent* step (minimising the loss).
-            ``p ← p - lr * grad``
+        Uses momentum-based descent with optional gradient clipping for stability.
+        - If momentum > 0: accumulate exponential moving average of gradients.
+        - Optionally clip large gradient updates for stability.
 
         Args:
             params: Dict of active parameter name → tensor.
-            grads:  Dict of pseudo-gradient name → tensor (same keys as
-                    ``params``).
-
-        Student task:
-            Replace with a more sophisticated update rule, e.g.:
-              - Momentum: accumulate an exponential moving average of gradients.
-              - Adam-style: maintain first and second moment estimates.
-              - Clipped update: ``p ← p - lr * clip(grad, max_norm)``.
+            grads:  Dict of pseudo-gradient name → tensor.
         """
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the parameter update below.
-        # ------------------------------------------------------------------
         with torch.no_grad():
             for name, param in params.items():
-                param.data.sub_(self.lr * grads[name])
-        # ------------------------------------------------------------------
+                grad = grads[name]
+
+                # Clip gradient for stability
+                max_grad_norm = 10.0
+                grad_norm = grad.norm()
+                if grad_norm > max_grad_norm:
+                    grad = grad * (max_grad_norm / grad_norm)
+
+                # Momentum: accumulate moving average
+                if self.momentum > 0:
+                    if name not in self.momentum_buffer:
+                        self.momentum_buffer[name] = torch.zeros_like(param)
+                    buf = self.momentum_buffer[name]
+                    buf.mul_(self.momentum).add_(grad, alpha=1.0 - self.momentum)
+                    param.data.sub_(self.lr * buf)
+                else:
+                    param.data.sub_(self.lr * grad)
 
     # ------------------------------------------------------------------
     # Public API
@@ -232,23 +266,18 @@ class ZeroOrderOptimizer:
 
         Calls ``loss_fn`` one or more times to estimate pseudo-gradients for
         the currently active parameters (``self.layer_names``), then applies
-        an update. Parameters *not* in ``self.layer_names`` are never touched.
+        an update. With SPSA, uses only 2 forward passes regardless of model size.
 
         Args:
             loss_fn: A callable that takes no arguments and returns a scalar
                      ``float`` representing the loss on the current mini-batch.
-                     ``validate.py`` guarantees that every call to ``loss_fn``
-                     within a single ``.step()`` invocation uses the *same*
-                     fixed batch of data.
 
         Returns:
-            The loss value at the *start* of the step (before any update),
-            obtained from the first call to ``loss_fn()``.
+            The loss value at the *start* of the step (before any update).
 
         Note:
-            ``validate.py`` calls ``.step()`` exactly ``n_batches`` times.
-            Each forward pass inside ``loss_fn`` counts toward your compute
-            budget, so prefer estimators that minimise the number of calls.
+            With SPSA enabled, this uses only 2 forward passes per step.
+            Without SPSA, it uses 2 * num_active_parameters forward passes.
         """
         params = self._active_params()
 
@@ -259,4 +288,5 @@ class ZeroOrderOptimizer:
         grads = self._estimate_grad(loss_fn, params)
         self._update_params(params, grads)
 
+        self.step_count += 1
         return float(loss_before)

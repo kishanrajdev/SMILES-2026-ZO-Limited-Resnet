@@ -32,6 +32,10 @@ def init_last_layer(layer: nn.Linear) -> None:
     # -------------------------------------------------------------------------
     # STUDENT: Replace or extend the initialization below.
     # -------------------------------------------------------------------------
-    nn.init.kaiming_uniform_(layer.weight, nonlinearity="relu")
-    nn.init.zeros_(layer.bias)
+    # Xavier uniform initialization for better variance preservation
+    nn.init.xavier_uniform_(layer.weight, gain=1.0)
+    # Initialize bias to small negative values to start conservatively
+    nn.init.constant_(layer.bias, -0.1)
+    # Scale weights down for conservative starting point
+    layer.weight.data.mul_(0.01)
     # -------------------------------------------------------------------------

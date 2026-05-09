@@ -47,10 +47,13 @@ def get_transforms(train: bool) -> T.Compose:
                 # between or around them as appropriate.
                 # ----------------------------------------------------------
                 T.Resize(224),
-                T.RandomHorizontalFlip(),
-                # Add more augmentations here ↓
+                T.RandomCrop(224, padding=28),
+                T.RandomHorizontalFlip(p=0.5),
+                T.RandomRotation(degrees=15),
+                T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
                 T.ToTensor(),
                 T.Normalize(mean=_CIFAR100_MEAN, std=_CIFAR100_STD),
+                T.RandomErasing(p=0.2, scale=(0.02, 0.33), ratio=(0.3, 3.3)),
                 # ----------------------------------------------------------
             ]
         )
