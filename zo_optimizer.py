@@ -63,11 +63,11 @@ class ZeroOrderOptimizer:
     def __init__(
         self,
         model: nn.Module,
-        lr: float = 5e-4,
-        eps: float = 1e-3,
+        lr: float = 1e-2,
+        eps: float = 1e-2,
         perturbation_mode: str = "gaussian",
         use_spsa: bool = True,
-        momentum: float = 0.7,
+        momentum: float = 0.0,
         eps_scheduler: str = "const",
     ) -> None:
         self.model = model
@@ -241,11 +241,8 @@ class ZeroOrderOptimizer:
             for name, param in params.items():
                 grad = grads[name]
 
-                # Clip gradient for stability - more aggressive clipping
-                max_grad_norm = 1.0
-                grad_norm = grad.norm()
-                if grad_norm > max_grad_norm:
-                    grad = grad * (max_grad_norm / grad_norm)
+                # No clipping - let gradients flow freely for now
+                # Clipping was preventing learning
 
                 # Momentum: accumulate moving average
                 if self.momentum > 0:
